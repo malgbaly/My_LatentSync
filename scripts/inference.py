@@ -21,6 +21,7 @@ from latentsync.models.unet import UNet3DConditionModel
 from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
 from accelerate.utils import set_seed
 from latentsync.whisper.audio2feature import Audio2Feature
+from latentsync.utils.memory_utils import MemoryManager
 
 
 def main(config, args):
@@ -29,6 +30,12 @@ def main(config, args):
     if not os.path.exists(args.audio_path):
         raise RuntimeError(f"Audio path '{args.audio_path}' not found")
 
+    # Initialize memory manager
+    memory_manager = MemoryManager()
+    
+    # Set memory fraction to prevent OOM
+    memory_manager.set_memory_fraction(0.8)
+    
     # Check if the GPU supports float16
     is_fp16_supported = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7
     dtype = torch.float16 if is_fp16_supported else torch.float32
@@ -37,8 +44,9 @@ def main(config, args):
     print(f"Input audio path: {args.audio_path}")
     print(f"Loaded checkpoint path: {args.inference_ckpt_path}")
 
+    # Load models with memory optimization
     scheduler = DDIMScheduler.from_pretrained("configs")
-
+    
     if config.model.cross_attention_dim == 768:
         whisper_model_path = "checkpoints/whisper/small.pt"
     elif config.model.cross_attention_dim == 384:
@@ -46,6 +54,7 @@ def main(config, args):
     else:
         raise NotImplementedError("cross_attention_dim must be 768 or 384")
 
+    # Initialize models with optimized settings
     audio_encoder = Audio2Feature(
         model_path=whisper_model_path,
         device="cuda",
@@ -65,6 +74,13 @@ def main(config, args):
 
     denoising_unet = denoising_unet.to(dtype=dtype)
 
+    # Calculate optimal batch size
+    model_size_mb = sum(p.numel() * p.element_size() for p in denoising_unet.parameters()) / (1024 * 1024)
+    available_memory_mb = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
+    optimal_batch_size = MemoryManager.get_optimal_batch_size(model_size_mb, available_memory_mb)
+    
+    print(f"Using batch size: {optimal_batch_size}")
+
     pipeline = LipsyncPipeline(
         vae=vae,
         audio_encoder=audio_encoder,
@@ -79,19 +95,29 @@ def main(config, args):
 
     print(f"Initial seed: {torch.initial_seed()}")
 
-    pipeline(
-        video_path=args.video_path,
-        audio_path=args.audio_path,
-        video_out_path=args.video_out_path,
-        video_mask_path=args.video_out_path.replace(".mp4", "_mask.mp4"),
-        num_frames=config.data.num_frames,
-        num_inference_steps=args.inference_steps,
-        guidance_scale=args.guidance_scale,
-        weight_dtype=dtype,
-        width=config.data.resolution,
-        height=config.data.resolution,
-        mask_image_path=config.data.mask_image_path,
-    )
+    try:
+        pipeline(
+            video_path=args.video_path,
+            audio_path=args.audio_path,
+            video_out_path=args.video_out_path,
+            video_mask_path=args.video_out_path.replace(".mp4", "_mask.mp4"),
+            num_frames=config.data.num_frames,
+            num_inference_steps=args.inference_steps,
+            guidance_scale=args.guidance_scale,
+            weight_dtype=dtype,
+            width=config.data.resolution,
+            height=config.data.resolution,
+            mask_image_path=config.data.mask_image_path,
+            batch_size=optimal_batch_size,
+        )
+    finally:
+        # Cleanup
+        memory_manager.clear_gpu_memory()
+        del pipeline
+        del vae
+        del denoising_unet
+        del audio_encoder
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

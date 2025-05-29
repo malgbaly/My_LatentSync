@@ -4,6 +4,8 @@
 import numpy as np
 from decord.video_reader import VideoReader
 from decord.audio_reader import AudioReader
+import os
+import torch
 
 from decord.ndarray import cpu
 from decord import ndarray as _nd
@@ -39,15 +41,65 @@ class AVReader(object):
         If 1 < `fault_tol`, if N > `fault_tol`, raise `DECORDLimitReachedError`.
     """
 
-    def __init__(
-        self, uri, ctx=cpu(0), sample_rate=44100, mono=True, width=-1, height=-1, num_threads=0, fault_tol=-1
-    ):
-        self.__audio_reader = AudioReader(uri, ctx, sample_rate, mono)
-        self.__audio_reader.add_padding()
-        if hasattr(uri, "read"):
-            uri.seek(0)
-        self.__video_reader = VideoReader(uri, ctx, width, height, num_threads, fault_tol)
-        self.__video_reader.seek(0)
+    def __init__(self, uri, ctx=None, sample_rate=-1, mono=True, width=-1, height=-1, num_threads=0, fault_tol=-1):
+        self.uri = uri
+        self.ctx = ctx
+        self.sample_rate = sample_rate
+        self.mono = mono
+        self.width = width
+        self.height = height
+        self.num_threads = num_threads
+        self.fault_tol = fault_tol
+        
+        # Initialize readers with optimized settings
+        self.video_reader = VideoReader(
+            uri,
+            ctx=ctx,
+            width=width,
+            height=height,
+            num_threads=num_threads or os.cpu_count(),
+            fault_tol=fault_tol
+        )
+        
+        self.audio_reader = AudioReader(
+            uri,
+            sample_rate=sample_rate,
+            mono=mono
+        )
+        
+        # Cache for frequently accessed frames
+        self._frame_cache = {}
+        self._max_cache_size = 100  # Adjust based on available memory
+        
+    def _get_frame(self, idx):
+        """Get frame with caching"""
+        if idx in self._frame_cache:
+            return self._frame_cache[idx]
+            
+        frame = self.video_reader[idx]
+        
+        # Update cache
+        if len(self._frame_cache) >= self._max_cache_size:
+            # Remove oldest entry
+            self._frame_cache.pop(next(iter(self._frame_cache)))
+        self._frame_cache[idx] = frame
+        
+        return frame
+        
+    def get_batch(self, indices):
+        """Get multiple frames efficiently"""
+        return [self._get_frame(idx) for idx in indices]
+        
+    def clear_cache(self):
+        """Clear frame cache"""
+        self._frame_cache.clear()
+        torch.cuda.empty_cache()
+        
+    def __del__(self):
+        """Cleanup"""
+        self.clear_cache()
+        del self.video_reader
+        del self.audio_reader
 
     def __len__(self):
         """Get length of the video. Note that sometimes FFMPEG reports inaccurate number of frames,
@@ -57,7 +109,7 @@ class AVReader(object):
         int
             The number of frames in the video file.
         """
-        return len(self.__video_reader)
+        return len(self.video_reader)
 
     def __getitem__(self, idx):
         """Get audio samples and video frame at `idx`.
@@ -78,80 +130,41 @@ class AVReader(object):
             Second element is Frame of shape HxWx3 or batch of image frames with shape NxHxWx3,
             where N is the length of the slice.
         """
-        assert self.__video_reader is not None and self.__audio_reader is not None
+        assert self.video_reader is not None and self.audio_reader is not None
         if isinstance(idx, slice):
-            return self.get_batch(range(*idx.indices(len(self.__video_reader))))
+            return self.get_batch(range(*idx.indices(len(self.video_reader))))
         if idx < 0:
-            idx += len(self.__video_reader)
-        if idx >= len(self.__video_reader) or idx < 0:
-            raise IndexError("Index: {} out of bound: {}".format(idx, len(self.__video_reader)))
-        audio_start_idx, audio_end_idx = self.__video_reader.get_frame_timestamp(idx)
-        audio_start_idx = self.__audio_reader._time_to_sample(audio_start_idx)
-        audio_end_idx = self.__audio_reader._time_to_sample(audio_end_idx)
-        results = (self.__audio_reader[audio_start_idx:audio_end_idx], self.__video_reader[idx])
-        self.__video_reader.seek(0)
-        return results
-
-    def get_batch(self, indices):
-        """Get entire batch of audio samples and video frames.
-
-        Parameters
-        ----------
-        indices : list of integers
-            A list of frame indices. If negative indices detected, the indices will be indexed from backward
-        Returns
-        -------
-        (list of ndarray, ndarray)
-            First element is a list of length N containing samples of shape CxS,
-            where N is the number of frames, C is the number of channels,
-            S is the number of samples of the corresponding frame.
-
-            Second element is Frame of shape HxWx3 or batch of image frames with shape NxHxWx3,
-            where N is the length of the slice.
-
-        """
-        assert self.__video_reader is not None and self.__audio_reader is not None
-        indices = self._validate_indices(indices)
-        audio_arr = []
-        prev_video_idx = None
-        prev_audio_end_idx = None
-        for idx in list(indices):
-            frame_start_time, frame_end_time = self.__video_reader.get_frame_timestamp(idx)
-            # timestamp and sample conversion could have some error that could cause non-continuous audio
-            # we detect if retrieving continuous frame and make the audio continuous
-            if prev_video_idx and idx == prev_video_idx + 1:
-                audio_start_idx = prev_audio_end_idx
-            else:
-                audio_start_idx = self.__audio_reader._time_to_sample(frame_start_time)
-            audio_end_idx = self.__audio_reader._time_to_sample(frame_end_time)
-            audio_arr.append(self.__audio_reader[audio_start_idx:audio_end_idx])
-            prev_video_idx = idx
-            prev_audio_end_idx = audio_end_idx
-        results = (audio_arr, self.__video_reader.get_batch(indices))
-        self.__video_reader.seek(0)
+            idx += len(self.video_reader)
+        if idx >= len(self.video_reader) or idx < 0:
+            raise IndexError("Index: {} out of bound: {}".format(idx, len(self.video_reader)))
+        audio_start_idx, audio_end_idx = self.video_reader.get_frame_timestamp(idx)
+        audio_start_idx = self.audio_reader._time_to_sample(audio_start_idx)
+        audio_end_idx = self.audio_reader._time_to_sample(audio_end_idx)
+        results = (self.audio_reader[audio_start_idx:audio_end_idx], self.video_reader[idx])
+        self.video_reader.seek(0)
         return results
 
     def _get_slice(self, sl):
-        audio_arr = np.empty(shape=(self.__audio_reader.shape()[0], 0), dtype="float32")
+        audio_arr = np.empty(shape=(self.audio_reader.shape()[0], 0), dtype="float32")
         for idx in list(sl):
-            audio_start_idx, audio_end_idx = self.__video_reader.get_frame_timestamp(idx)
-            audio_start_idx = self.__audio_reader._time_to_sample(audio_start_idx)
-            audio_end_idx = self.__audio_reader._time_to_sample(audio_end_idx)
+            audio_start_idx, audio_end_idx = self.video_reader.get_frame_timestamp(idx)
+            audio_start_idx = self.audio_reader._time_to_sample(audio_start_idx)
+            audio_end_idx = self.audio_reader._time_to_sample(audio_end_idx)
             audio_arr = np.concatenate(
-                (audio_arr, self.__audio_reader[audio_start_idx:audio_end_idx].asnumpy()), axis=1
+                (audio_arr, self.audio_reader[audio_start_idx:audio_end_idx].asnumpy()), axis=1
             )
-        results = (bridge_out(_nd.array(audio_arr)), self.__video_reader.get_batch(sl))
-        self.__video_reader.seek(0)
+        results = (bridge_out(_nd.array(audio_arr)), self.video_reader.get_batch(sl))
+        self.video_reader.seek(0)
         return results
 
     def _validate_indices(self, indices):
         """Validate int64 integers and convert negative integers to positive by backward search"""
-        assert self.__video_reader is not None and self.__audio_reader is not None
+        assert self.video_reader is not None and self.audio_reader is not None
         indices = np.array(indices, dtype=np.int64)
         # process negative indices
-        indices[indices < 0] += len(self.__video_reader)
+        indices[indices < 0] += len(self.video_reader)
         if not (indices >= 0).all():
-            raise IndexError("Invalid negative indices: {}".format(indices[indices < 0] + len(self.__video_reader)))
-        if not (indices < len(self.__video_reader)).all():
-            raise IndexError("Out of bound indices: {}".format(indices[indices >= len(self.__video_reader)]))
+            raise IndexError("Invalid negative indices: {}".format(indices[indices < 0] + len(self.video_reader)))
+        if not (indices < len(self.video_reader)).all():
+            raise IndexError("Out of bound indices: {}".format(indices[indices >= len(self.video_reader)]))
         return indices
